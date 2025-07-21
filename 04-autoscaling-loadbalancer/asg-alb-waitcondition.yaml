@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'AutoScaling Group with ALB using CreationPolicy'
+Description: 'AutoScaling Group with ALB using WaitCondition'
 
 Parameters:
   KeyPairName:
@@ -27,6 +27,10 @@ Resources:
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ASG-IGW
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -41,6 +45,9 @@ Resources:
       CidrBlock: '10.0.1.0/24'
       AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet1
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -49,11 +56,17 @@ Resources:
       CidrBlock: '10.0.2.0/24'
       AvailabilityZone: !Select [1, !GetAZs '']
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet2
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
 
   PublicRoute:
     Type: AWS::EC2::Route
@@ -79,18 +92,21 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for ALB
+      GroupDescription: Security group for Application Load Balancer
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-SecurityGroup
 
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for instances
+      GroupDescription: Security group for EC2 instances
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -102,13 +118,57 @@ Resources:
           ToPort: 22
           CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
-        - IpProtocol: -1
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Instance-SecurityGroup
+
+  # IAM Role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: EC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Wait Condition Resources
+  WaitConditionHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    Properties:
+      Handle: !Ref WaitConditionHandle
+      Timeout: '900'
+      Count: 2
 
   # Application Load Balancer
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
+      Name: MyALB
       Scheme: internet-facing
       Type: application
       Subnets:
@@ -116,15 +176,26 @@ Resources:
         - !Ref PublicSubnet2
       SecurityGroups:
         - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: MyALB
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      Name: MyTargetGroup
       Port: 80
       Protocol: HTTP
       VpcId: !Ref VPC
       HealthCheckPath: /
       HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: MyTargetGroup
 
   ALBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -136,93 +207,36 @@ Resources:
       Port: 80
       Protocol: HTTP
 
-  # Launch Template with Metadata
+  # Launch Template
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
-    Metadata:
-      AWS::CloudFormation::Init:
-        configSets:
-          default:
-            - install_packages
-            - configure_apache
-            - start_services
-        install_packages:
-          packages:
-            yum:
-              httpd: []
-              aws-cfn-bootstrap: []
-        configure_apache:
-          files:
-            /var/www/html/index.html:
-              content: !Sub |
-                <!DOCTYPE html>
-                <html>
-                <head>
-                  <title>Auto Scaling Demo</title>
-                  <style>
-                    body { font-family: Arial, sans-serif; margin: 40px; }
-                    .header { color: #232F3E; }
-                    .info { background: #f0f0f0; padding: 20px; border-radius: 5px; }
-                  </style>
-                </head>
-                <body>
-                  <h1 class="header">Hello from Auto Scaling Group!</h1>
-                  <div class="info">
-                    <p><strong>Instance:</strong> $(hostname -f)</p>
-                    <p><strong>Stack:</strong> ${AWS::StackName}</p>
-                    <p><strong>Region:</strong> ${AWS::Region}</p>
-                    <p><strong>Load Balancer:</strong> Active</p>
-                  </div>
-                </body>
-                </html>
-              mode: '000644'
-              owner: apache
-              group: apache
-            /etc/httpd/conf.d/custom.conf:
-              content: |
-                ServerTokens Prod
-                ServerSignature Off
-              mode: '000644'
-              owner: root
-              group: root
-        start_services:
-          services:
-            sysvinit:
-              httpd:
-                enabled: true
-                ensureRunning: true
-                files:
-                  - /var/www/html/index.html
-                  - /etc/httpd/conf.d/custom.conf
     Properties:
+      LaunchTemplateName: MyLaunchTemplate
       LaunchTemplateData:
         ImageId: ami-0c02fb55956c7d316
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyPairName
         SecurityGroupIds:
           - !Ref InstanceSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
             yum update -y
+            yum install -y httpd aws-cfn-bootstrap
+            systemctl start httpd
+            systemctl enable httpd
+            echo "<h1>Hello from $(hostname -f)</h1>" > /var/www/html/index.html
             
-            # Get metadata and configure instance
-            /opt/aws/bin/cfn-get-metadata -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
-            
-            # Initialize instance using metadata
-            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region} --configsets default
-            
-            # Signal success to CloudFormation
-            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+            # Signal the wait condition
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WaitCondition --region ${AWS::Region} '${WaitConditionHandle}'
 
-  # Auto Scaling Group with CreationPolicy
+  # Auto Scaling Group
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    CreationPolicy:
-      ResourceSignal:
-        Count: 2
-        Timeout: PT10M
     Properties:
+      AutoScalingGroupName: MyASG
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
@@ -236,12 +250,20 @@ Resources:
         - !Ref TargetGroup
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: ASG-Instance
+          PropagateAtLaunch: true
 
 Outputs:
   LoadBalancerDNS:
-    Description: DNS name of the ALB
+    Description: DNS name of the Application Load Balancer
     Value: !GetAtt ApplicationLoadBalancer.DNSName
   
   LoadBalancerURL:
-    Description: URL of the ALB
+    Description: URL of the Application Load Balancer
     Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  
+  WaitConditionData:
+    Description: Data from wait condition
+    Value: !GetAtt WaitCondition.Data
